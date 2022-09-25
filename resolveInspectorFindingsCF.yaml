@@ -1,0 +1,714 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+
+  #-------------------------------------------------
+  # Automation IAM role to invoke the two Automation runbooks
+  #-------------------------------------------------
+  AutomationRolePolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Action:
+          - inspector2:ListFindings
+          - securityHub:GetFindings
+          - ssm:*
+          Resource: '*'
+        - Effect: Allow
+          Action:
+          - s3:PutObject
+          Resource: !Join [ '', [!GetAtt InstallOverrideListBucket.Arn, '/*'] ]
+        - Effect: Allow
+          Action:
+          - ssm:StartAutomationExecution
+          Resource:
+            - Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${AutomationRunPatchBaselineRunbook}:$DEFAULT
+        - Action: iam:PassRole
+          Resource:
+            !GetAtt AutomationIAMRole.Arn
+          Effect: Allow
+        - Action: sts:AssumeRole
+          Resource:
+            Fn::Sub: arn:${AWS::Partition}:iam::*:role/resolveInspectorExecutionRole
+          Effect: Allow
+        - Action: organizations:ListAccountsForParent
+          Resource: '*'
+          Effect: Allow
+        Version: 2012-10-17
+      PolicyName: !Sub Automation-Inspector-${AWS::StackName}
+      Roles:
+        - !Ref AutomationIAMRole
+
+  AutomationIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Automation IAM role to resolve Inspector findings
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ssm.amazonaws.com
+          Action: sts:AssumeRole
+
+  #-------------------------------------------------
+  # Automation IAM role to invoke the two Automation runbooks
+  #-------------------------------------------------
+  automationRolePolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Action:
+          - tag:GetResources
+          - inspector2:ListFindings
+          - securityHub:GetFindings
+          - ssm:DescribeAutomationStepExecutions
+          - ssm:DescribeInstanceAssociationsStatus
+          - ssm:DescribeInstanceInformation
+          - ssm:GetAutomationExecution
+          - ssm:ListCommands
+          - ssm:ListCommandInvocations
+          Resource: '*'
+        - Effect: Allow
+          Action:
+          - s3:PutObject
+          Resource: !Sub "arn:${AWS::Partition}:s3:::${InstallOverrideListBucket}/*"
+        - Effect: Allow
+          Action:
+          - ssm:StartAutomationExecution
+          Resource:
+            - Fn::Sub: arn:${AWS::Partition}:ssm:*:*:automation-definition/${AutomationRunPatchBaselineRunbook}:*
+        - Effect: Allow
+          Action:
+          - ssm:SendCommand
+          Resource:
+            - Fn::Sub: arn:${AWS::Partition}:ssm:*::document/AWS-RefreshAssociation
+            - Fn::Sub: arn:${AWS::Partition}:ssm:*::document/AWS-RunPatchBaseline
+            - Fn::Sub: arn:${AWS::Partition}:ec2:*:*:instance/*
+        - Action: iam:PassRole
+          Resource:
+            !GetAtt automationExecutionIAMRole.Arn
+          Effect: Allow
+          Condition:
+            StringEquals:
+              iam:PassedToService: ssm.amazonaws.com
+        Version: 2012-10-17
+      PolicyName: !Sub Automation-Inspector-${AWS::StackName}
+      Roles:
+        - !Ref automationExecutionIAMRole
+  automationExecutionIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: resolveInspectorExecutionRole
+      Description: Automation IAM role to resolve Inspector findings
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ssm.amazonaws.com
+          Action: sts:AssumeRole
+        - Effect: Allow
+          Principal:
+            AWS:
+            - !Ref 'AWS::AccountId'
+          Action: sts:AssumeRole
+
+  #-------------------------------------------------
+  # Bucket used to store install override list
+  #-------------------------------------------------
+  InstallOverrideListBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: BucketOwnerFullControl
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  #-------------------------------------------------
+  # Bucket policy to allow retrieval of install override list from accounts within the AWS Organization
+  #-------------------------------------------------
+  InstallOverrideListBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InstallOverrideListBucket
+      PolicyDocument:
+        Statement:
+        - Sid: SSMGetObject
+          Effect: Allow
+          Principal: "*"
+          Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:PutObjectAcl
+          Resource:
+            - !Join [ '', [!GetAtt InstallOverrideListBucket.Arn, '/*'] ]
+          Condition:
+            StringEquals:
+              aws:PrincipalAccount: !Ref AWS::AccountId
+
+  #-------------------------------------------------
+  # Automation runbooks to create an install override list and patch target instance
+  #-------------------------------------------------
+  AutomationRunPatchBaselineRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      TargetType: /AWS::EC2::Instance
+      Content:
+        description: |-
+        schemaVersion: '0.3'
+        assumeRole: '{{AutomationAssumeRole}}'
+        parameters:
+          AutomationAssumeRole:
+            type: 'AWS::IAM::Role::Arn'
+            description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.
+            default: !GetAtt AutomationIAMRole.Arn
+          IncludeKernelUpdates:
+            type: Boolean
+            description: (Required) Choose to include kernel updates for patch installation. Valid values are 'true' and 'false'.
+            default: false
+            allowedValues:
+            - true
+            - false
+          InspectorFindingArn:
+            type: String
+            description: (Optional) The ARN of the Inspector finding.
+            default: ''
+          InstanceIds:
+            type: 'StringList'
+            description: (Optional) The instance IDs to target.
+          Operation:
+            type: String
+            default: Install
+            allowedValues:
+            - Install
+            description: >-
+              (Required) The update or configuration to perform on the instance. The
+              system checks if patches specified in the patch baseline are installed on
+              the instance. The install operation installs patches missing from the
+              baseline.
+          RebootOption:
+            type: String
+            default: RebootIfNeeded
+            allowedValues:
+            - RebootIfNeeded
+            - NoReboot
+            description: >-
+              (Optional) Reboot behavior after a patch Install operation. If you choose
+              NoReboot and patches are installed, the instance is marked as non-compliant
+              until a subsequent reboot and scan.
+          S3BucketName:
+            type: 'AWS::S3::Bucket::Name'
+            description: (Required) The name of the S3 bucket to store the install override list.
+            default: !Ref InstallOverrideListBucket
+          S3BucketKey:
+            type: String
+            description: (Required) The S3 key path to store the install override list.
+            default: inspector/installOverrideList/
+          SeverityFilter:
+            type: String
+            description: (Optional) The severity to filter for Inspector findings.
+            default: 'NONE'
+            allowedValues:
+              - NONE
+              - UNTRIAGED
+              - INFORMATIONAL
+              - LOW
+              - MEDIUM
+              - HIGH
+              - CRITICAL
+          Source:
+            type: String
+            description: (Required) The source for the event.
+            default: aws.ssm.automation
+            allowedValues:
+              - aws.ssm.automation
+              - aws.securityhub
+        mainSteps:
+          - name: generateInstallOverrideList
+            action: 'aws:executeScript'
+            description: >-
+              This action generates an install override list for the target managed node based on Inspector findings and stores the list in the specified S3 bucket.
+            outputs:
+              - Type: String
+                Name: s3UriInstallOverrideList
+                Selector: $.Payload.s3UriInstallOverrideList
+              - Type: String
+                Name: sourceAwsAccountId
+                Selector: $.Payload.sourceAwsAccountId
+              - Type: String
+                Name: sourceRegion
+                Selector: $.Payload.sourceRegion
+              - Type: String
+                Name: updatesMissing
+                Selector: $.Payload.updatesMissing
+            inputs:
+              Runtime: python3.8
+              Handler: script_handler
+              InputPayload:
+                includeKernelUpdates: '{{ IncludeKernelUpdates }}'
+                inspectorFindingArn: '{{ InspectorFindingArn }}'
+                instanceId: '{{ InstanceIds }}'
+                s3BucketName: '{{ S3BucketName }}'
+                s3BucketKey: '{{ S3BucketKey }}'
+                severityFilter: '{{ SeverityFilter }}'
+                source: '{{ Source }}'
+              Script: |-
+                import sys
+                import boto3
+
+                import json
+                from datetime import datetime
+
+                import logging
+                logger = logging.getLogger()
+                logger.setLevel(logging.INFO)
+
+                inspector = boto3.client('inspector2')
+                s3 = boto3.client('s3')
+
+                def put_object_to_s3(s3BucketName,s3BucketKey,installOverrideList):
+
+                  try:
+                    logger.info('Put InstallOverrideList to S3 bucket: {}'.format(s3BucketName))
+
+                    #Put object to S3
+                    putObjectResponse = s3.put_object(
+                            Bucket = s3BucketName,
+                            Key = s3BucketKey,
+                            Body = installOverrideList
+                        )
+                    return putObjectResponse
+
+                  except Exception as e:
+                      logger.info('Failed to put InstallOverrideList to S3 bucket: {}'.format(s3BucketName))
+
+                def list_inspector_findings(instanceId,inspectorFindingArn='NONE',severityFilter='NONE'):
+
+                  try:
+                    logger.info('Retrieving Inspector findings for: {}'.format(instanceId))
+
+                    if inspectorFindingArn!='NONE':
+                      #Inspector finding ARN is provided, do not use severity filter
+                      listFindingsResponse = inspector.list_findings(
+                              filterCriteria={
+                                #Filter for instance ID provided
+                                'resourceId':[
+                                  {
+                                    'comparison':'EQUALS',
+                                    'value':instanceId
+                                  }
+                                ],
+                                #Filter for Inspector finding ARN
+                                'findingArn': [
+                                  {
+                                      'comparison': 'EQUALS',
+                                      'value': inspectorFindingArn
+                                  },
+                                ],
+                                #Filter for package vulnerabilities, do not include network vulnerabilities
+                                'findingType':[
+                                  {
+                                    'comparison':'EQUALS',
+                                    'value':'PACKAGE_VULNERABILITY'
+                                  }
+                                ]
+                              }
+                            )
+
+                    elif inspectorFindingArn=='NONE' and severityFilter=='NONE':
+                      #No Inspector ARN or severity filter provided, get all active findings for the instance
+                      listFindingsResponse = inspector.list_findings(
+                        filterCriteria={
+                          'resourceId':[
+                            {
+                              'comparison':'EQUALS',
+                              'value':instanceId
+                            }
+                          ],
+                          #Filter for package vulnerabilities, do not include network vulnerabilities
+                          'findingType':[
+                            {
+                              'comparison':'EQUALS',
+                              'value':'PACKAGE_VULNERABILITY'
+                            }
+                          ],
+                          #Filter for active Inspector findings
+                          'findingStatus':[
+                            {
+                              'comparison':'EQUALS',
+                              'value':'ACTIVE'
+                            }
+                          ]
+                        }
+                      )
+
+                    elif inspectorFindingArn=='NONE':
+                      # No Inspector finding ARN provided but severity filter is provided, get actuve all findings for severity specified
+                      listFindingsResponse = inspector.list_findings(
+                        filterCriteria={
+                          'resourceId':[
+                            {
+                              'comparison':'EQUALS',
+                              'value':instanceId
+                            }
+                          ],
+                          #Filter for package vulnerabilities, do not include network vulnerabilities
+                          'findingType':[
+                            {
+                              'comparison':'EQUALS',
+                              'value':'PACKAGE_VULNERABILITY'
+                            }
+                          ],
+                          #Filter for active Inspector findings
+                          'findingStatus':[
+                            {
+                              'comparison':'EQUALS',
+                              'value':'ACTIVE'
+                            }
+                          ],
+                          #Filter based on severity specified
+                          'severity':[
+                            {
+                              'comparison':'EQUALS',
+                              'value':severityFilter
+                            }
+                          ]
+                        }
+                      )
+
+                    return listFindingsResponse
+
+                  except Exception as e:
+                    logger.info('Failed to retrieve Inspector findings for: {}'.format(instanceId))
+
+                def get_unique_packages_to_update(instanceFindings,includeKernelUpdates=True):
+
+                  #Create empty package list
+                  packagesList = []
+
+                  try:
+                    logger.info('Retrieving list of unique packages to update')
+
+                    #Loop through findings
+                    for finding in instanceFindings:
+                      vulnerablePackages = finding['packageVulnerabilityDetails']['vulnerablePackages']
+
+                      #Loop through vulnerable pacakges
+                      for package in vulnerablePackages:
+
+                        #Create list of package names
+                        packagesList.append(package['name'])
+
+                    #Convert to set to get list of unique packages
+                    packagesListSet = set(packagesList)
+
+                    #Convert back to continue
+                    packagesList = list(packagesListSet)
+
+                    if not includeKernelUpdates:
+                      #Remove kernel updates from package list
+                      packagesList = [x for x in packagesList if not x.startswith("kernel")]
+                      #packagesList.remove("kernel")
+
+                    return packagesList
+
+                  except Exception as e:
+                      logger.info('Failed to create list of unique packages to update')
+
+                def create_install_override_list(packagesList):
+
+                  #Create empty package list to update
+                  packagesToUpdate = []
+
+                  try:
+                    logger.info('Creating install override list')
+
+                    #Loop through package list to create JSON formatted list expected by InstallOverrideList
+                    for package in packagesList:
+                      packagesToUpdate.append(
+                        {
+                          'id': package+'.*'
+                        }
+                      )
+
+                    #Create JSON formatted InstallOverrideList
+                    installOverrideList = json.dumps({'patches': packagesToUpdate})
+
+                    return installOverrideList
+
+                  except Exception as e:
+                      logger.info('Failed to create install override list')
+
+                def script_handler(events, context):
+
+                  print('boto3 version')
+                  print(boto3.__version__)
+
+                  #Ingest event details
+                  includeKernelUpdates = events['includeKernelUpdates']
+                  inspectorFindingArn = events['inspectorFindingArn']
+                  instanceId = events['instanceId']
+                  s3BucketKey = events['s3BucketKey']
+                  s3BucketName = events['s3BucketName']
+                  severityFilter = events['severityFilter']
+                  source = events['source']
+
+                  #Convert instanceId to String type
+                  instanceId = ''.join(instanceId)
+
+                  #Get current date and time
+                  now = datetime.now()
+
+                  #Format date time to YY-mm-dd-H:M:S format
+                  formattedDateTime = now.strftime("%Y-%m-%d-%H:%M:%S")
+
+                  #Create empty package list to update
+                  packagesToUpdate = []
+
+                  #Set InstallOverrideList filename
+                  fileName = instanceId+'-override-list-'+formattedDateTime+'.json'
+
+                  #Custom action from Security Hub
+                  if source=="aws.securityhub":
+
+                    listFindingsResponse = list_inspector_findings(instanceId=instanceId,inspectorFindingArn=inspectorFindingArn)
+
+                    instanceFindings = listFindingsResponse['findings']
+
+                    #Loop through findings and get unique packages list to update
+                    packagesList = get_unique_packages_to_update(instanceFindings)
+
+                    #Check if package list contains vulnerable packages, exit if not
+                    if not packagesList:
+                      return {'updatesMissing':'false'}
+
+                    else:
+
+                      sourceAwsAccountId = instanceFindings[0]['awsAccountId']
+                      sourceRegion = instanceFindings[0]['resources'][0]['region']
+
+                      #Loop through package list to create JSON formatted list expected by InstallOverrideList
+                      installOverrideList = create_install_override_list(packagesList)
+
+                      #S3 bucket key default: inspector/installOverrideList/
+                      #Build out bucket key with source account ID and region
+                      s3BucketKeyModified = s3BucketKey+'accountid='+sourceAwsAccountId+"/"+'region='+sourceRegion+"/"+fileName
+
+                      #Put InstallOverrideList in S3
+                      put_object_to_s3(s3BucketName,s3BucketKeyModified,installOverrideList)
+
+                      #Build out S3 URI
+                      s3UriInstallOverrideList = 's3://'+s3BucketName+'/'+s3BucketKeyModified
+
+                      return {'s3UriInstallOverrideList':s3UriInstallOverrideList, 'sourceAwsAccountId':sourceAwsAccountId,'sourceRegion':sourceRegion,'updatesMissing':'true'}
+
+                  #Manual invocation
+                  elif source=="aws.ssm.automation":
+
+                    if severityFilter=='NONE':
+                      #No severity filter provided, get all findings
+                      listFindingsResponse = list_inspector_findings(instanceId=instanceId)
+
+                    else:
+                      # Severity filter provided, get all findings for specified severity
+                      listFindingsResponse = list_inspector_findings(instanceId=instanceId,severityFilter=severityFilter)
+
+                    instanceFindings = listFindingsResponse['findings']
+
+                    #Loop through findings and get unique packages list to update
+                    packagesList = get_unique_packages_to_update(instanceFindings,includeKernelUpdates)
+
+                    #Check if package list contains vulnerable packages, exit if not
+                    if not packagesList:
+                      #No Inspector findings for package vulnerabilities
+                      return {'updatesMissing':'false'}
+
+                    else:
+
+                      sourceAwsAccountId = instanceFindings[0]['awsAccountId']
+                      sourceRegion = instanceFindings[0]['resources'][0]['region']
+
+                      #Loop through package list to create JSON formatted list expected by InstallOverrideList
+                      installOverrideList = create_install_override_list(packagesList)
+
+                      #S3 bucket key default: inspector/installOverrideList/
+                      #Build out bucket key with source account ID and region
+                      s3BucketKeyModified = s3BucketKey+'accountid='+sourceAwsAccountId+"/"+'region='+sourceRegion+"/"+fileName
+
+                      #Put InstallOverrideList in S3
+                      put_object_to_s3(s3BucketName,s3BucketKeyModified,installOverrideList)
+
+                      #Build out S3 URI
+                      s3UriInstallOverrideList = 's3://'+s3BucketName+'/'+s3BucketKeyModified
+
+                      return {'s3UriInstallOverrideList':s3UriInstallOverrideList, 'sourceAwsAccountId':sourceAwsAccountId,'sourceRegion':sourceRegion,'updatesMissing':'true'}
+
+                  else:
+                    sys.exit("No matching source, exiting...")
+          - name: verifyUpdatesAreMissing
+            action: aws:branch
+            inputs:
+              Choices:
+              - NextStep: runPatchBaseline
+                Variable: "{{generateInstallOverrideList.updatesMissing}}"
+                StringEquals: 'true'
+              Default:
+                noUpdatesInstalled
+          - name: runPatchBaseline
+            action: 'aws:runCommand'
+            timeoutSeconds: 7200
+            onFailure: Abort
+            description: >-
+              This action runs the Command document ```AWS-RunPatchBaseline``` on the target managed node.
+            inputs:
+              DocumentName: AWS-RunPatchBaseline
+              InstanceIds:
+                - '{{ InstanceIds }}'
+              Parameters:
+                Operation: '{{ Operation }}'
+                RebootOption: '{{ RebootOption }}'
+                InstallOverrideList: '{{ generateInstallOverrideList.s3UriInstallOverrideList }}'
+          - name: noUpdatesInstalled
+            action: aws:sleep
+            isEnd: true
+            inputs:
+              Duration: PT30S
+
+  #-------------------------------------------------
+  # Custom Association and Document
+  #-------------------------------------------------
+  InventoryCollection:
+    Type: 'AWS::SSM::Association'
+    Properties:
+      Name: !Ref 'InventoryCollectionDocument'
+      AssociationName: 'InventoryCollection-ResolveInspectorFindings'
+      Targets:
+        - Key: 'tag:Environment'
+          Values:
+            - 'Production'
+  InventoryCollectionDocument:
+    Type: "AWS::SSM::Document"
+    Properties:
+      DocumentType: "Command"
+      Content:
+        schemaVersion: "2.2"
+        description: "Collect software inventory and kernel information"
+        parameters:
+          applications:
+            type: "String"
+            default: "Enabled"
+            description: "(Optional) Collect data for installed applications."
+            allowedValues:
+              - "Enabled"
+              - "Disabled"
+          awsComponents:
+            type: "String"
+            default: "Enabled"
+            description: "(Optional) Collect data for AWS Components like amazon-ssm-agent."
+            allowedValues:
+              - "Enabled"
+              - "Disabled"
+          files:
+            type: "String"
+            default: ""
+            description: "<p>(Optional, requires SSMAgent version 2.2.64.0 and above)<br/><br/>Linux example:<br/><em>[{\"Path\":\"/usr/bin\", \"Pattern\":[\"aws*\", \"*ssm*\"],\"Recursive\":false},{\"Path\":\"/var/log\", \"Pattern\":[\"amazon*.*\"], \"Recursive\":true, \"DirScanLimit\":1000}]<br/></em><br/>Windows example:<br/><em>[{\"Path\":\"%PROGRAMFILES%\", \"Pattern\":[\"*.exe\"],\"Recursive\":true}]</em><br/><br/>Learn More: http://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-inventory-about.html#sysman-inventory-file-and-registry  </p>"
+            displayType: "textarea"
+          networkConfig:
+            type: "String"
+            default: "Enabled"
+            description: "(Optional) Collect data for Network configurations."
+            allowedValues:
+              - "Enabled"
+              - "Disabled"
+          windowsUpdates:
+            type: "String"
+            default: "Enabled"
+            description: "(Optional, Windows OS only) Collect data for all Windows Updates."
+            allowedValues:
+              - "Enabled"
+              - "Disabled"
+          instanceDetailedInformation:
+            type: "String"
+            default: "Enabled"
+            description: "(Optional) Collect additional information about the instance, including the CPU model, speed, and the number of cores, to name a few."
+            allowedValues:
+              - "Enabled"
+              - "Disabled"
+          services:
+            type: "String"
+            default: "Enabled"
+            description: "(Optional, Windows OS only, requires SSMAgent version 2.2.64.0 and above) Collect data for service configurations."
+            allowedValues:
+              - "Enabled"
+              - "Disabled"
+          windowsRegistry:
+            type: "String"
+            default: ""
+            description: "<p>(Optional, Windows OS only, requires SSMAgent version 2.2.64.0 and above)<br/><br/>Example:<br />[{\"Path\":\"HKEY_CURRENT_CONFIG\\System\",\"Recursive\":true},{\"Path\":\"HKEY_LOCAL_MACHINE\\SOFTWARE\\Amazon\\MachineImage\", \"ValueNames\":[\"AMIName\"]}]<br/><br/>Learn More: http://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-inventory-about.html#sysman-inventory-file-and-registry </p>"
+            displayType: "textarea"
+          windowsRoles:
+            type: "String"
+            default: "Enabled"
+            description: "(Optional, Windows OS only, requires SSMAgent version 2.2.64.0 and above) Collect data for Microsoft Windows role configurations."
+            allowedValues:
+              - "Enabled"
+              - "Disabled"
+          customInventory:
+            type: "String"
+            default: "Enabled"
+            description: "(Optional) Collect data for custom inventory."
+            allowedValues:
+              - "Enabled"
+              - "Disabled"
+          billingInfo:
+            type: "String"
+            default: "Enabled"
+            description: "(Optional) Collect billing info for license included applications."
+            allowedValues:
+              - "Enabled"
+              - "Disabled"
+        mainSteps:
+          - action: "aws:runShellScript"
+            name: "collectCustomInventoryItems"
+            inputs:
+              timeoutSeconds: 7200
+              runCommand:
+                - "#!/bin/bash"
+                - "token=$(curl --silent --show-error --retry 3 -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\")"
+                - "instance_id=$(curl --silent --show-error --retry 3 -H \"X-aws-ec2-metadata-token: $token\" http://169.254.169.254/latest/meta-data/instance-id)"
+                - "kernel_version=$(uname -r)"
+                - "content=\"{\\\"SchemaVersion\\\": \\\"1.0\\\", \\\"TypeName\\\": \\\"Custom:SystemInfo\\\", \\\"Content\\\": {\\\"KernelVersion\\\": \\\"$kernel_version\\\"}}\""
+                - "dir_path=\"/var/lib/amazon/ssm/$instance_id/inventory/custom\""
+                - "mkdir -p $dir_path"
+                - "echo $content > $dir_path/CustomSystemInfo.json"
+          - action: "aws:softwareInventory"
+            name: "collectSoftwareInventoryItems"
+            inputs:
+              applications: "{{ applications }}"
+              awsComponents: "{{ awsComponents }}"
+              networkConfig: "{{ networkConfig }}"
+              files: "{{ files }}"
+              services: "{{ services }}"
+              windowsRoles: "{{ windowsRoles }}"
+              windowsRegistry: "{{ windowsRegistry}}"
+              windowsUpdates: "{{ windowsUpdates }}"
+              instanceDetailedInformation: "{{ instanceDetailedInformation }}"
+              billingInfo: "{{ billingInfo }}"
+              customInventory: "{{ customInventory }}"
